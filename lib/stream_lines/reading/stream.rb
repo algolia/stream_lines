@@ -7,13 +7,14 @@ module StreamLines
   module Reading
     class Stream
       include Enumerable
-    
-      def initialize(url, encoding: Encoding.default_external)
+
+      def initialize(url, encoding: Encoding.default_external, chunk_size: nil, read_timeout: 90)
         @url = url
         @encoding = encoding
         @buffer = String.new(encoding: @encoding)
         @from_offset = 0
-        @chunk_size = 1024 * 1000 * 10 # 10 Mb chunks 
+        @chunk_size = chunk_size || 1024 * 1000 * 1 # 1 Mb chunks
+        @read_timeout = read_timeout
       end
 
       def each(&block)
@@ -29,37 +30,31 @@ module StreamLines
         max_retries = 8
 
         begin
-          remote_file = Down.open(url,  
-            read_timeout: 120, # should this be more ? 
+          remote_file = Down.open(url,
+            read_timeout: @read_timeout,
             rewindable: false,
             headers: { "Range" => "bytes=#{@from_offset * @chunk_size}-" }
           )
 
-          while !remote_file.eof? do
+          until remote_file.eof?
             chunk = remote_file.read(@chunk_size)
             lines = extract_lines(chunk)
             lines.each { |line| block.call(line) }
             @from_offset += 1
           end
-          
-          remote_file.close 
+
+          remote_file.close
           block.call(@buffer) if @buffer.size.positive?
 
-        rescue  Down::ConnectionError,
-          Down::TimeoutError,
-          Down::ServerError,
-          Down::SSLError => e
+        rescue Down::ConnectionError, Down::TimeoutError, Down::ServerError, Down::SSLError => e
+          raise Exception, "Giving up after #{retries} retries: #{e}" unless retries <= max_retries
 
-          if retries <= max_retries
-            sleep(2**retries)
-            retries += 1
-            retry
-          else
-            raise Exception.new "Giving up after #{retries} retries: #{e}"
-          end
-        rescue Exception => e
-          raise Exception.new "Something else happened #{e}"
-        end        
+          sleep(2**retries)
+          retries += 1
+          retry
+        ensure
+          remote_file&.close
+        end
       end
 
       def extract_lines(chunk)
